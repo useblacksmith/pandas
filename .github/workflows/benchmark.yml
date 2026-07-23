@@ -1,0 +1,90 @@
+# Benchmark workflow for the pandas-dev/pandas fork.
+#
+# Workload derived from upstream .github/workflows/unit-tests.yml
+# (ubuntu unit tests: build the C/Cython extensions from source with meson,
+# then run the test suite via the same pytest markers as ci/run_tests.sh),
+# simplified to a single linear job: one python version (3.11), pip instead
+# of conda, no locale/dtype matrix. See DECISIONS.md #7.
+#
+# See forks/vite/benchmark.yml for the conventions shared by all forks
+# (runs-on mapping, "workload:" step-name prefix, cold/warm semantics).
+
+name: benchmark
+run-name: "bench ${{ inputs.environment }} ${{ inputs.cache_state }} ${{ inputs.batch_id }} ${{ inputs.run_key }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Runner environment under test
+        type: choice
+        required: true
+        options: [github, github-8core, ec2, blacksmith]
+      cache_state:
+        description: cold = no caches, warm = environment-native caches
+        type: choice
+        required: true
+        options: [cold, warm]
+      batch_id:
+        description: Collection batch this run belongs to
+        type: string
+        required: true
+      run_key:
+        description: Unique key set by the orchestrator to find this run via the API
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ${{ fromJSON('{"github":"ubuntu-latest","github-8core":"benchmark-8core","ec2":"benchmark-ec2","blacksmith":"blacksmith-8vcpu-ubuntu-2404"}')[inputs.environment] }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start telemetry
+        uses: ./.github/actions/telemetry/start
+        continue-on-error: true
+        with:
+          runner_label: ${{ inputs.environment }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Warm state persists the pip wheel/http cache; the meson build itself
+      # is always from scratch (upstream CI rebuilds every run too).
+      - name: Restore pip cache (warm, GitHub-hosted)
+        if: inputs.cache_state == 'warm' && inputs.environment != 'blacksmith'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: bench-pip-${{ hashFiles('requirements-dev.txt') }}
+
+      - name: Restore pip cache (warm, Blacksmith)
+        if: inputs.cache_state == 'warm' && inputs.environment == 'blacksmith'
+        uses: useblacksmith/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: bench-pip-${{ hashFiles('requirements-dev.txt') }}
+
+      # --- workload (mirrors upstream unit-tests.yml + ci/run_tests.sh) ---
+      - name: "workload: install dev requirements"
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: "workload: build pandas from source"
+        run: python -m pip install -ve . --no-build-isolation
+
+      - name: "workload: run test suite"
+        env:
+          PANDAS_CI: "1"
+        run: >
+          python -m pytest pandas/tests
+          -m "not slow and not network and not db and not single_cpu"
+          -n auto --dist=loadfile -r fEs
+
+      - name: Stop telemetry
+        if: always()
+        uses: ./.github/actions/telemetry/stop

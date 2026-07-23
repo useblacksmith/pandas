@@ -1,0 +1,41 @@
+# Benchmark telemetry -- start half.
+#
+# Vendored into each fork at .github/actions/telemetry/. Records static host
+# facts and launches a background /proc sampler. Pair with the `stop` action
+# as the last step of the job, guarded by `if: always()`:
+#
+#   - uses: ./.github/actions/telemetry/start
+#     with:
+#       runner_label: ${{ runner.name }}   # or the requested runs-on label
+#   ... workload ...
+#   - uses: ./.github/actions/telemetry/stop
+#     if: always()
+#
+# Composite actions cannot register a `post:` step (that is a JS-action-only
+# feature), so teardown is an explicit always() step -- see DECISIONS.md #1.
+#
+# Every step here is best-effort: telemetry must never fail a benchmark run.
+# A run without telemetry is still a valid timing sample.
+name: benchmark-telemetry-start
+description: Capture host facts and start a background resource sampler (never fails the job)
+
+inputs:
+  interval_seconds:
+    description: Sampling interval in seconds
+    default: "2"
+  runner_label:
+    description: The runs-on label requested by the workflow, recorded in host facts
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Start telemetry sampler
+      shell: bash
+      continue-on-error: true
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/../scripts/start.py" \
+          --dir "${RUNNER_TEMP}/benchmark-telemetry" \
+          --interval "${{ inputs.interval_seconds }}" \
+          --runner-label "${{ inputs.runner_label }}" \
+          || echo "::warning::telemetry start failed (run remains valid, no telemetry)"

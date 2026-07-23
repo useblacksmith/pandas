@@ -1,0 +1,30 @@
+# Benchmark telemetry -- stop half.
+#
+# Terminates the sampler started by ../start, assembles telemetry.json
+# (host facts + full sample series + derived aggregates), and uploads it as
+# the workflow artifact `telemetry-<run_id>` that collect.py expects.
+#
+# Must be the LAST step of the benchmark job with `if: always()` so it runs
+# even when a workload step fails. Never fails the job itself.
+name: benchmark-telemetry-stop
+description: Stop the sampler, write telemetry.json, upload it as an artifact (never fails the job)
+
+runs:
+  using: composite
+  steps:
+    - name: Finalize telemetry
+      shell: bash
+      continue-on-error: true
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/../scripts/finalize.py" \
+          --dir "${RUNNER_TEMP}/benchmark-telemetry" \
+          || echo "::warning::telemetry finalize failed (run remains valid, no telemetry)"
+
+    - name: Upload telemetry artifact
+      uses: actions/upload-artifact@v4
+      continue-on-error: true
+      with:
+        name: telemetry-${{ github.run_id }}
+        path: ${{ runner.temp }}/benchmark-telemetry/telemetry.json
+        if-no-files-found: warn
+        retention-days: 90
