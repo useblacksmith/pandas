@@ -43,6 +43,11 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags: the from-source build derives its version via
+          # git describe; a depth-1 tagless checkout yields "0+untagged", which
+          # pyarrow rejects (warning escalated to error by pandas' pytest config).
+          fetch-depth: 0
 
       - name: Start telemetry
         uses: ./.github/actions/telemetry/start
