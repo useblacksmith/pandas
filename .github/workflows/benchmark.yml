@@ -1,10 +1,19 @@
 # Benchmark workflow for the pandas-dev/pandas fork.
 #
-# Workload derived from upstream .github/workflows/unit-tests.yml
-# (ubuntu unit tests: build the C/Cython extensions from source with meson,
-# then run the test suite via the same pytest markers as ci/run_tests.sh),
-# simplified to a single linear job: one python version (3.11), pip instead
-# of conda, no locale/dtype matrix. See DECISIONS.md #7.
+# Workload: the COMPLETE "ubuntu" job from upstream
+# .github/workflows/unit-tests.yml (transcribed from upstream 2026-07-23 --
+# re-verify against the file at the pinned commit) for the matrix leg
+# { platform: ubuntu-24.04, environment: py311, marker: "" }: pixi
+# environment, meson build of the C/Cython extensions, import check, then
+# BOTH test passes (not single_cpu with xdist, then single_cpu) via
+# upstream's own ./.github/actions/run-tests, with the mysql/postgres/moto
+# service containers upstream runs against. The ONLY cut is the Codecov
+# upload (needs upstream's CODECOV_TOKEN secret).
+#
+# Upstream's ./.github/actions/setup-pixi wrapper is inlined below (it
+# hard-wires cache: true and cache-write on push-to-main, which would break
+# cold/warm control); the same underlying prefix-dev/setup-pixi action and
+# inputs are used, with caching guarded by cache_state.
 #
 # See forks/vite/benchmark.yml for the conventions shared by all forks
 # (runs-on mapping, "workload:" step-name prefix, cold/warm semantics).
@@ -21,7 +30,7 @@ on:
         required: true
         options: [github, github-8core, ec2, blacksmith]
       cache_state:
-        description: cold = no caches, warm = environment-native caches
+        description: cold = no caches, warm = upstream cache configuration
         type: choice
         required: true
         options: [cold, warm]
@@ -37,16 +46,58 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash -euox pipefail {0}
+
+env:
+  LANG: C.UTF-8
+  PIXI_ENV: py311
+
 jobs:
   benchmark:
     runs-on: ${{ fromJSON('{"github":"ubuntu-latest","github-8core":"benchmark-8core","ec2":"benchmark-ec2","blacksmith":"blacksmith-8vcpu-ubuntu-2404"}')[inputs.environment] }}
     timeout-minutes: 120
+
+    # Upstream "ubuntu" job service containers, verbatim.
+    services:
+      mysql:
+        image: mysql:9
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: yes
+          MYSQL_DATABASE: pandas
+        options: >-
+          --health-cmd "mysqladmin ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+
+      postgres:
+        image: postgres:18
+        env:
+          PGUSER: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pandas
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      moto:
+        image: motoserver/moto:5.1.18
+        ports:
+          - 5000:5000
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          # Full history + tags: the from-source build derives its version via
-          # git describe; a depth-1 tagless checkout yields "0+untagged", which
-          # pyarrow rejects (warning escalated to error by pandas' pytest config).
           fetch-depth: 0
 
       - name: Start telemetry
@@ -55,40 +106,60 @@ jobs:
         with:
           runner_label: ${{ inputs.environment }}
 
-      - uses: actions/setup-python@v5
+      # --- inlined ./.github/actions/setup-pixi, caching under our control ---
+      - name: Create virtual environment with Pixi
+        uses: prefix-dev/setup-pixi@v0.10.0 # version upstream pins; re-check at pin time
         with:
-          python-version: "3.11"
+          pixi-version: v0.69.0
+          log-level: vv
+          manifest-path: pixi.toml
+          environments: ${{ env.PIXI_ENV }}
+          cache: ${{ inputs.cache_state == 'warm' }}
+          cache-write: ${{ inputs.cache_state == 'warm' }}
 
-      # Warm state persists the pip wheel/http cache; the meson build itself
-      # is always from scratch (upstream CI rebuilds every run too).
-      - name: Restore pip cache (warm, GitHub-hosted)
-        if: inputs.cache_state == 'warm' && inputs.environment != 'blacksmith'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: bench-pip-${{ hashFiles('requirements-dev.txt') }}
+      # --- upstream "ubuntu" job steps, in upstream order ---
+      - name: "workload: Build pandas"
+        run: |
+          pixi run \
+            --environment ${{ env.PIXI_ENV }} \
+            build-pandas \
+            --editable \
+            -Csetup-args="--werror"
 
-      - name: Restore pip cache (warm, Blacksmith)
-        if: inputs.cache_state == 'warm' && inputs.environment == 'blacksmith'
-        uses: useblacksmith/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: bench-pip-${{ hashFiles('requirements-dev.txt') }}
+      - name: "workload: Import check"
+        run: |
+          pixi run \
+            --environment ${{ env.PIXI_ENV }} \
+            ci-check-import
 
-      # --- workload (mirrors upstream unit-tests.yml + ci/run_tests.sh) ---
-      - name: "workload: install dev requirements"
-        run: python -m pip install -r requirements-dev.txt
-
-      - name: "workload: build pandas from source"
-        run: python -m pip install -ve . --no-build-isolation
-
-      - name: "workload: run test suite"
+      - name: "workload: Test (not single_cpu)"
+        uses: ./.github/actions/run-tests
         env:
-          PANDAS_CI: "1"
-        run: >
-          python -m pytest pandas/tests
-          -m "not slow and not network and not db and not single_cpu"
-          -n auto --dist=loadfile -r fEs
+          # Ensure port matches moto service
+          PANDAS_MOTO_URL: "http://localhost:5000"
+        with:
+          environment: ${{ env.PIXI_ENV }}
+          numprocesses: "auto"
+          pytest_marker_expression: "not single_cpu"
+          pytest_target: pandas
+          pandas_future_infer_string: "1"
+          pandas_future_python_scalars: "0"
+
+      - name: "workload: Test (single_cpu)"
+        uses: ./.github/actions/run-tests
+        env:
+          # Ensure port matches moto service
+          PANDAS_MOTO_URL: "http://localhost:5000"
+        with:
+          environment: ${{ env.PIXI_ENV }}
+          numprocesses: 0
+          pytest_marker_expression: "single_cpu"
+          pytest_target: pandas
+          pandas_future_infer_string: "1"
+          pandas_future_python_scalars: "0"
+
+      # Upstream's final step, "Upload test coverage to Codecov", is the one
+      # omission: it requires upstream's CODECOV_TOKEN secret.
 
       - name: Stop telemetry
         if: always()
